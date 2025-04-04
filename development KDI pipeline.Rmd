@@ -1,0 +1,1664 @@
+---
+title: "Developing KDI pipeline"
+author: "Abel Torres Espin"
+date: '2025-04-03'
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Libraries
+
+```{r}
+library(tidyverse)
+library(DT)
+library(readxl)
+library(forecast) ## for time series functionalities
+library(lme4)
+library(lmerTest)
+library(gganimate)
+library(splines)
+library(vegan)
+library(patchwork)
+```
+
+## Utility functions
+
+### Plotting functions
+
+The following function allows for the plotting of all the data of an animal and reach type
+
+```{r}
+plot_reach<-function(df, reach.type = "successful"){
+  df<-df%>%
+    filter(reach_type ==reach.type)
+  
+  start<-df%>%
+    group_by(reach)%>%
+    mutate(start = ifelse(frame == 1, "start", NA))%>%
+    filter(!is.na(start))
+
+  end<-df%>%
+    group_by(reach)%>%
+    mutate(end = ifelse(frame == max(frame, na.rm = T), "end", NA))%>%
+    filter(!is.na(end))
+
+  pellet_center_df<-df%>%
+    group_by(reach)%>%
+    filter(frame %in% 1:10)%>%
+    summarise(x_p_smooth = median(x_p_smooth), y_p_smooth = median(y_p_smooth))
+
+  plot<-df%>%
+    ggplot(aes(x_smooth, y_smooth))+
+    geom_path(alpha = 1, show.legend = F, aes(group = reach))+
+    geom_point(data = start, color = "red")+
+      geom_point(data = end, color = "green")+
+      geom_point(data = pellet_center_df, aes(x = x_p_smooth, y = y_p_smooth),color = "purple")+
+      geom_path(data = df, aes(x = x_p_smooth, y = y_p_smooth), color = "purple")+
+    facet_grid(digit~reach)+
+    theme_bw()+
+    ggtitle(paste(reach.type, unique(df$animal_id)))
+  
+  return(plot)
+}
+```
+
+### KDI functions
+
+#### GPA function
+Function to run GPA as for Gower algorithm through the 2 step process.
+
+```{r}
+## GPA function
+GPA<-function(X_list, tolerance = 0.0001){
+  
+  m<-length(X_list)
+  
+  n_row <-nrow(X_list[[1]])
+  n_col <-ncol(X_list[[1]])
+  
+  ## initialize set list of T transformation from m = 2 to m = m with identity
+  T0<-diag(nrow = n_col,ncol = n_col)
+  
+  ## initialize result list
+  AT_list<-lapply(X_list, function(x){
+    as.matrix(x) %*% T0
+  })
+  
+  ## Internal function for the iteration of steps 2 to M
+  proc_2M_steps<-function(X_list, m, AT_list){
+    for (i in 1:m){
+      if (i == 1){
+        B<-apply(simplify2array(AT_list[2:m]), 1:2, sum)
+      }else if (i %in% 2:m){
+        AT_fit <- apply(simplify2array(AT_list[1:(i-1)]), 1:2, sum)
+        B<-AT_fit+apply(simplify2array(AT_list[i:m]), 1:2, sum)
+      }else if (i == m){
+        B<-apply(simplify2array(AT_list[1:(m-1)]), 1:2, sum)
+      }
+      fit<-pracma::procrustes(B,AT_list[[i]])
+      AT_list[[i]]<-fit$P## the matrix P is AT
+    }
+    
+    return(list("AT_list" = AT_list))
+  }
+  
+  ## sequence of 10
+  res_AT_list<-list()
+  Sr<-list()
+  Y<-list()
+  
+  ## first sequence
+  first_2M<-proc_2M_steps(X_list, m = m, AT_list)
+  res_AT_list[[1]]<-first_2M$AT_list
+  Y[[1]]<-apply(simplify2array(res_AT_list[[1]]), 1:2, mean)
+  Sr[[1]]<-sum(diag((Y[[1]]%*%t(Y[[1]]))))
+  
+  
+  Sr_diff<-1 
+  t<-2 ## iteration counter for convergence
+  
+  while(Sr_diff>tolerance){
+    
+    t_2M<-proc_2M_steps(res_AT_list[[t-1]],m=m, res_AT_list[[t-1]])
+    res_AT_list[[t]]<-t_2M$AT_list
+    
+    Y[[t]]<-apply(simplify2array(res_AT_list[[t]]), 1:2, mean)
+    Sr[[t]]<-sum(diag((Y[[t]]%*%t(Y[[t]]))))
+    
+    Sr_diff<-abs(Sr[[t]]-Sr[[t-1]])
+    t<-t+1
+  }
+  
+  results<-list("consensus" = Y[[t-1]], "iterations" = t-1,
+                "fitted_X" = res_AT_list[[t-1]])
+  
+  return(results)
+}
+```
+
+# Cohort 1: NT study
+## Read data
+
+This section reads the files and process them to have them in a single dataset for downstream processing.
+
+### Pre injury
+```{r}
+unsuccess_data<-read_xlsx("data/original/Uninjured pca data all digits.xlsx", sheet = 1)
+unsuccess_data$reachtype<-"unsuccessful"
+
+success_data<-read_xlsx("data/original/Uninjured pca data all digits.xlsx", sheet = 2)
+success_data$reachtype<-"successful"
+
+attempt_pellet_data<-read_xlsx("data/original/Uninjured pca data all digits.xlsx", sheet = 3)
+attempt_pellet_data$reachtype<-"attempt_pellet"
+
+attempt_Nopellet_data<-read_xlsx("data/original/Uninjured pca data all digits.xlsx", sheet = 4)
+attempt_Nopellet_data$reachtype<-"attempt_Nopellet"
+
+raw_data<-rbind(unsuccess_data, success_data, attempt_pellet_data, attempt_Nopellet_data)
+
+colnames(raw_data)<-c("frame", "x_d1", "x_d2", "x_d3", "x_d4", "y_d1", "y_d2", 
+                       "y_d3", "y_d4", "x_p", "y_p","digit_spread", "pellet_d1",
+                       "pellet_d2", "pellet_d3", "pellet_d4",
+                       "angle", "animal_id", "reach_type") 
+
+raw_data<-raw_data%>%
+  arrange(animal_id)
+
+raw_data$reach<-NA
+count_reaches<-0
+animal<-"4393"
+for (i in 1:nrow(raw_data)){
+  if (raw_data$frame[i] == 1 & raw_data$animal_id[i] == animal){
+    count_reaches<-count_reaches+1
+  }else if (raw_data$animal_id[i] != animal){
+    animal<-raw_data$animal_id[i]
+    count_reaches<-1
+  }
+  raw_data$reach[i]<-count_reaches
+}
+
+raw_data$timepoint<-"pre_injury"
+```
+
+### Post SCI
+```{r}
+unsuccess_data_post<-read_xlsx("data/original/Post-SCI pca data all digits.xlsx", sheet = 1)
+unsuccess_data_post$reachtype<-"unsuccessful"
+
+success_data_post<-read_xlsx("data/original/Post-SCI pca data all digits.xlsx", sheet = 2)
+success_data_post$reachtype<-"successful"
+
+attempt_pellet_data_post<-read_xlsx("data/original/Post-SCI pca data all digits.xlsx", sheet = 3)
+attempt_pellet_data_post$reachtype<-"attempt_pellet"
+
+attempt_Nopellet_data_post<-read_xlsx("data/original/Post-SCI pca data all digits.xlsx", sheet = 4)
+attempt_Nopellet_data_post$reachtype<-"attempt_Nopellet"
+
+raw_data_post<-rbind(unsuccess_data_post, success_data_post, attempt_pellet_data_post, attempt_Nopellet_data_post)
+
+colnames(raw_data_post)<-c("frame", "x_d1", "x_d2", "x_d3", "x_d4", "y_d1", "y_d2", 
+                       "y_d3", "y_d4", "x_p", "y_p","digit_spread", "pellet_d1",
+                       "pellet_d2", "pellet_d3", "pellet_d4",
+                       "angle", "animal_id", "reach_type") 
+
+raw_data_post<-raw_data_post%>%
+  arrange(animal_id)
+
+raw_data_post$reach<-NA
+count_reaches<-0
+animal<-"4393"
+for (i in 1:nrow(raw_data_post)){
+  if (raw_data_post$frame[i] == 1 & raw_data_post$animal_id[i] == animal){
+    count_reaches<-count_reaches+1
+  }else if (raw_data_post$animal_id[i] != animal){
+    animal<-raw_data_post$animal_id[i]
+    count_reaches<-1
+  }
+  raw_data_post$reach[i]<-count_reaches
+}
+
+raw_data_post$timepoint<-"post-SCI"
+```
+
+### 8Weeks SCI
+```{r}
+unsuccess_data_8w<-read_xlsx("data/original/Wk8 pca data all digits.xlsx", sheet = 1)
+unsuccess_data_8w$reachtype<-"unsuccessful"
+
+# success_data_8w<-read_xlsx("data/original/Wk8 pca data all digits.xlsx", sheet = 2)
+# success_data_8w$reachtype<-"successful"
+
+attempt_pellet_data_8w<-read_xlsx("data/original/Wk8 pca data all digits.xlsx", sheet = 2)
+attempt_pellet_data_8w$reachtype<-"attempt_pellet"
+
+attempt_Nopellet_data_8w<-read_xlsx("data/original/Wk8 pca data all digits.xlsx", sheet = 3)
+attempt_Nopellet_data_8w$reachtype<-"attempt_Nopellet"
+
+raw_data_8w<-rbind(unsuccess_data_8w,attempt_pellet_data_8w, attempt_Nopellet_data_8w)
+
+colnames(raw_data_8w)<-c("frame", "x_d1", "x_d2", "x_d3", "x_d4", "y_d1", "y_d2", 
+                       "y_d3", "y_d4", "x_p", "y_p","digit_spread", "pellet_d1",
+                       "pellet_d2", "pellet_d3", "pellet_d4",
+                       "angle", "animal_id", "reach_type") 
+
+raw_data_8w<-raw_data_8w%>%
+  arrange(animal_id)
+
+raw_data_8w$reach<-NA
+count_reaches<-0
+animal<-"4393"
+for (i in 1:nrow(raw_data_8w)){
+  if (raw_data_8w$frame[i] == 1 & raw_data_8w$animal_id[i] == animal){
+    count_reaches<-count_reaches+1
+  }else if (raw_data_8w$animal_id[i] != animal){
+    animal<-raw_data_8w$animal_id[i]
+    count_reaches<-1
+  }
+  raw_data_8w$reach[i]<-count_reaches
+}
+
+raw_data_8w$timepoint<-"8w-SCI"
+```
+
+### 16 Weeks SCI
+```{r}
+unsuccess_data_16w<-read_xlsx("data/original/Wk16 pca data all digits.xlsx", sheet = 1)
+unsuccess_data_16w$reachtype<-"unsuccessful"
+
+# success_data_16w<-read_xlsx("data/original/Wk16 pca data all digits.xlsx", sheet = 2)
+# success_data_16w$reachtype<-"successful"
+
+attempt_pellet_data_16w<-read_xlsx("data/original/Wk16 pca data all digits.xlsx", sheet = 2)
+attempt_pellet_data_16w$reachtype<-"attempt_pellet"
+
+attempt_Nopellet_data_16w<-read_xlsx("data/original/Wk16 pca data all digits.xlsx", sheet = 3)
+attempt_Nopellet_data_16w$reachtype<-"attempt_Nopellet"
+
+raw_data_16w<-rbind(unsuccess_data_16w,attempt_pellet_data_16w, attempt_Nopellet_data_16w)
+
+colnames(raw_data_16w)<-c("frame", "x_d1", "x_d2", "x_d3", "x_d4", "y_d1", "y_d2", 
+                       "y_d3", "y_d4", "x_p", "y_p","digit_spread", "pellet_d1",
+                       "pellet_d2", "pellet_d3", "pellet_d4",
+                       "angle", "animal_id", "reach_type") 
+
+raw_data_16w<-raw_data_16w%>%
+  arrange(animal_id)
+
+raw_data_16w$reach<-NA
+count_reaches<-0
+animal<-"4393"
+for (i in 1:nrow(raw_data_16w)){
+  if (raw_data_16w$frame[i] == 1 & raw_data_16w$animal_id[i] == animal){
+    count_reaches<-count_reaches+1
+  }else if (raw_data_16w$animal_id[i] != animal){
+    animal<-raw_data_16w$animal_id[i]
+    count_reaches<-1
+  }
+  raw_data_16w$reach[i]<-count_reaches
+}
+
+raw_data_16w$timepoint<-"16w-SCI"
+```
+
+### Join datasets
+
+```{r}
+raw_data_all<-bind_rows(raw_data, raw_data_post, raw_data_8w, raw_data_16w)
+```
+
+## Clean all data
+
+```{r}
+# create unique reach identifier
+raw_data_all<-raw_data_all%>%
+  mutate(reach_id = paste(timepoint, animal_id, reach, sep = "_"))
+
+raw_data_all_long<-raw_data_all%>%
+  pivot_longer(cols = c(x_d1, x_d2, x_d3, x_d4, y_d1, y_d2, y_d3, y_d4, 
+                        pellet_d1, pellet_d2, pellet_d3, pellet_d4))%>%
+  mutate(digit=str_split(name, "_", simplify = T)[,2], 
+         pos_var = str_split(name, "_", simplify = T)[,1],
+         pos_var = ifelse(pos_var == "pellet", "dist_pellet", pos_var))%>%
+  select(-name)%>%
+  pivot_wider(id_cols = c(animal_id, timepoint, reach_id, frame,digit, x_p, y_p,
+                          digit_spread, angle, reach_type), names_from = pos_var)
+
+## Calculate distances between digits
+raw_data_all<-raw_data_all%>%
+  group_by(reach_id, frame)%>%
+  mutate(d1_d2 = dist(rbind(c(x_d1, y_d1),
+                            c(x_d2, y_d2))),
+         d2_d3 = dist(rbind(c(x_d2, y_d2),
+                            c(x_d3, y_d3))),
+         d3_d4 = dist(rbind(c(x_d3, y_d3),
+                            c(x_d4, y_d4))))
+
+# save dataset for future use
+saveRDS(raw_data_all, "raw_data_all.Rda")
+```
+
+```{r}
+#load raw all dataset
+raw_data_all<-readRDS("raw_data_all.Rda")
+
+#determine quantile thresholds
+thr_d1_d2<-quantile(raw_data_all$d1_d2, probs = 0.92)
+thr_d2_d3<-quantile(raw_data_all$d2_d3, probs = 0.92)
+thr_d3_d4<-quantile(raw_data_all$d3_d4, probs = 0.92)
+
+#Eliminate extremes filtered based on the distance between digits
+clean_data_all<-raw_data_all%>%
+  ungroup()%>%
+  rowwise()%>%
+  mutate(x_d1 = ifelse(d1_d2>thr_d1_d2, NA, x_d1),
+         y_d1 = ifelse(d1_d2>thr_d1_d2, NA, y_d1),
+         x_d2 = ifelse(d2_d3>thr_d2_d3 | d1_d2>thr_d1_d2, NA, x_d2),
+         y_d2 = ifelse(d2_d3>thr_d2_d3 | d1_d2>thr_d1_d2, NA, y_d2),
+         x_d3 = ifelse(d2_d3>thr_d2_d3 | d3_d4>thr_d3_d4, NA, x_d3),
+         y_d3 = ifelse(d2_d3>thr_d2_d3 | d3_d4>thr_d3_d4, NA, y_d3),
+         x_d4 = ifelse(d3_d4>thr_d3_d4, NA, x_d4),
+         y_d4 = ifelse(d3_d4>thr_d3_d4, NA, y_d4))
+
+# Calculate mahalanobis distance
+out<-psych::outlier(clean_data_all[,c(2,9)])
+
+clean_data_all<-clean_data_all%>%
+  ungroup()%>%
+  mutate(out = out,
+         filter_out = out>10)%>%## filter based on mahalanobis distance
+  filter(filter_out == FALSE)
+```
+
+
+```{r}
+# Summarise based on proportion of NA values. Those reaches with high NA (more tha 20%) are excluded
+clean_summary<-clean_data_all%>%
+  group_by(reach_id)%>%
+  summarise_at(.vars = c("x_d1", "y_d1", "x_d2", "y_d2", "x_d3", "y_d3", "x_d4", "y_d4"),
+               .funs = function(x) {mean(is.na(x))})
+
+clean_summary$means_nas<-rowMeans(clean_summary[,-1])
+reach_to_keep<-clean_summary$reach_id[which(clean_summary$means_nas<=0.2)]
+
+clean_data_all<-clean_data_all%>%
+  filter(reach_id%in%reach_to_keep)
+
+# Transform to long format
+clean_data_all_long<-clean_data_all%>%
+  pivot_longer(cols = c(x_d1, x_d2, x_d3, x_d4, y_d1, y_d2, y_d3, y_d4, 
+                        pellet_d1, pellet_d2, pellet_d3, pellet_d4))%>%
+  mutate(digit=str_split(name, "_", simplify = T)[,2], 
+         pos_var = str_split(name, "_", simplify = T)[,1],
+         pos_var = ifelse(pos_var == "pellet", "dist_pellet", pos_var))%>%
+  select(-name)%>%
+  pivot_wider(id_cols = c(animal_id, timepoint, reach_id, frame,digit, x_p, y_p,
+                          digit_spread, angle, reach_type), names_from = pos_var)
+
+
+## Use tsclean and supsmu to clean temporal outliers and smooth
+clean_data_all_s<-clean_data_all_long%>%
+  group_by(reach_id, digit)%>%
+  mutate(n_frame= n())%>%
+  filter(n_frame>=20)%>%
+  filter(frame<=(n_frame-5))%>%
+  mutate(clean_x = tsclean(x),
+         clean_y = tsclean(y),
+         clean_x_p = tsclean(x_p),
+         clean_y_p = tsclean(y_p))%>%
+  mutate(smooth_x = supsmu(x = frame, y = clean_x, span = 0.05)$y,
+         smooth_y = supsmu(x = frame, y = clean_y, span = 0.05)$y,
+         smooth_x_p = supsmu(x = frame, y = clean_x_p, span = 0.05)$y,
+         smooth_y_p = supsmu(x = frame, y = clean_y_p, span = 0.05)$y)
+
+## Add features
+clean_data_all_wide<-clean_data_all_s%>%
+  pivot_wider(id_cols = c(animal_id, timepoint, reach_id, frame, reach_type),
+              names_from = "digit",
+                values_from = c("smooth_x","smooth_y", "x", "y"))
+
+clean_data_all_wide<-clean_data_all_wide%>%
+  group_by(reach_id, frame)%>%
+  mutate(d1_d4 = as.numeric(dist(rbind(c(smooth_x_d1, smooth_y_d1),
+                            c(smooth_x_d4, smooth_y_d4)))),
+         angle = sin((smooth_x_d1-smooth_x_d4)/d1_d4)*57.29)%>%
+  group_by(reach_id)%>%
+  mutate(d1_x_speed = abs(c(0,diff(smooth_x_d1))),
+         d1_y_speed = abs(c(0,diff(smooth_y_d1))),
+         d2_x_speed = abs(c(0,diff(smooth_x_d2))),
+         d2_y_speed = abs(c(0,diff(smooth_y_d2))),
+         d3_x_speed = abs(c(0,diff(smooth_x_d3))),
+         d3_y_speed = abs(c(0,diff(smooth_y_d3))),
+         d4_x_speed = abs(c(0,diff(smooth_x_d4))),
+         d4_y_speed = abs(c(0,diff(smooth_y_d4))))
+         
+
+clean_data_all_wide%>%
+    filter(reach_id == "pre_injury_4873_20")%>%
+  ggplot()+
+  geom_segment(aes(x = smooth_x_d1, xend = smooth_x_d4, 
+                   y = smooth_y_d1, yend = smooth_y_d4), color = "grey")+
+    geom_point(aes(smooth_x_d1, smooth_y_d1))+
+  geom_point(aes(smooth_x_d4, smooth_y_d4), color = "red")+
+  # geom_text(aes(smooth_x_d4, smooth_y_d4, label = round(angle,2)))+
+    # geom_line(aes(frame, b), color = "red")+
+  facet_wrap(~frame)
+
+clean_data_all_wide%>%
+    filter(animal_id == "4873", reach_type == "successful")%>%
+  ggplot()+
+  geom_line(aes(frame, d4_y_speed))+
+    # geom_line(aes(frame, b), color = "red")+
+  facet_wrap(~reach_id)
+
+saveRDS(clean_data_all_wide, "clean_data_all_wide.Rds")
+```
+
+### Check cleaning
+
+```{r}
+raw_data_all%>%
+    filter(timepoint == "pre_injury", reach_type == "successful",
+         animal_id == "4875")%>%
+  ggplot(aes(x_d3,y_d4))+
+  geom_path()+
+  geom_path(data = clean_data_all_wide%>%
+    filter(timepoint == "pre_injury", reach_type == "successful",
+         animal_id == "4875"), aes(x_d3, y_d3), color = "red")+
+  facet_wrap(~reach_id)
+
+raw_data_all%>%
+    filter(timepoint == "pre_injury", reach_type == "successful",
+         animal_id == "4875")%>%
+  ggplot(aes(frame,y_d3))+
+  geom_path()+
+  geom_path(data = clean_data_all_wide%>%
+    filter(timepoint == "pre_injury", reach_type == "successful",
+         animal_id == "4875"), aes(frame, y_d3), color = "red")+
+  facet_wrap(~reach_id)
+
+clean_data_all_wide_norm%>%
+  filter(animal_id=="4875", reach_type == "successful",timepoint == "pre_injury")%>%
+  ggplot(aes(smooth_x_d1, smooth_y_d1, group = reach_id))+
+  geom_path()+
+  geom_path(aes(x=smooth_x_d2, y = smooth_y_d2), color = "red")+
+  geom_path(aes(x=smooth_x_d3, y = smooth_y_d3), color = "orange")+
+  geom_path(aes(x=smooth_x_d4, y = smooth_y_d4), color = "blue")+
+  facet_wrap(~reach_id)
+
+raw_data_all%>%
+    filter(animal_id=="4904", reach_type == "successful", reach == 41)%>%
+  ggplot(aes(x_d1, y_d1))+
+  geom_path()+
+  geom_path(aes( x = x_d2, y = y_d2), color = "red")+
+  geom_path(aes( x = x_d3, y = y_d3), color = "orange")+
+  geom_path(aes( x = x_d4, y = y_d4), color = "blue")
+
+raw_data_all_long%>%
+    filter(animal_id=="4904", reach_type == "successful")%>%
+  ggplot(aes(frame, x, color = digit))+
+  geom_path()+
+  facet_wrap(~reach_id)
+```
+
+### time normalization
+```{r}
+clean_data_all_wide_norm<-clean_data_all_wide%>%
+  group_by(reach_id)%>%
+  summarise(animal_id = unique(animal_id),
+            frame = 1:100,
+            timepoint = unique(timepoint),
+            reach_type = unique(reach_type),
+            smooth_x_d1 = approx(x = 1:n(), y = smooth_x_d1, n = 100)$y,
+            smooth_x_d2 = approx(x = 1:n(), y = smooth_x_d2, n = 100)$y, 
+            smooth_x_d3 = approx(x = 1:n(), y = smooth_x_d3, n = 100)$y, 
+            smooth_x_d4 = approx(x = 1:n(), y = smooth_x_d4, n = 100)$y, 
+            smooth_y_d1 = approx(x = 1:n(), y = smooth_y_d1, n = 100)$y, 
+            smooth_y_d2 = approx(x = 1:n(), y = smooth_y_d2, n = 100)$y, 
+            smooth_y_d3 = approx(x = 1:n(), y = smooth_y_d3, n = 100)$y, 
+            smooth_y_d4 = approx(x = 1:n(), y = smooth_y_d4, n = 100)$y,
+            d1_d4 = approx(x = 1:n(), y = d1_d4, n = 100)$y,
+            angle = approx(x = 1:n(), y = angle, n = 100)$y,
+            d1_x_speed = approx(x = 1:n(), y = d1_x_speed, n = 100)$y,
+            d2_x_speed = approx(x = 1:n(), y = d2_x_speed, n = 100)$y,
+            d3_x_speed = approx(x = 1:n(), y = d3_x_speed, n = 100)$y,
+            d4_x_speed = approx(x = 1:n(), y = d4_x_speed, n = 100)$y,
+            d1_y_speed = approx(x = 1:n(), y = d1_y_speed, n = 100)$y,
+            d2_y_speed = approx(x = 1:n(), y = d2_y_speed, n = 100)$y,
+            d3_y_speed = approx(x = 1:n(), y = d3_y_speed, n = 100)$y,
+            d4_y_speed = approx(x = 1:n(), y = d4_y_speed, n = 100)$y)
+
+saveRDS(clean_data_all_wide_norm, "clean_data_all_wide_norm.Rds")
+```
+
+## Experimental information
+
+```{r}
+animal_group<-data.frame(animal_id=c("4873","4874","4904","4907",
+                                     "4910","4911","4913","4915","4918","4875",
+                                     "4902","4903","4906","4909",
+                                     "4908","4912","4914","4916","4917"),
+                         group = c(rep("NT", 9), rep("NT+ES", 10)))
+
+sex_paw<-read.csv("data/original/sex_paw_preference.csv")
+colnames(sex_paw)[1]<-"animal_id"
+
+animal_group<-sex_paw%>%
+  mutate(animal_id = as.character(animal_id))%>%
+  full_join(animal_group)
+
+table(animal_group$group, animal_group$Sex)
+table(animal_group$group, animal_group$paw_preference)
+```
+
+
+## KDI normalized
+
+### Univariate
+
+```{r}
+all_data_df<-all_data_df%>%
+  mutate(animal_id = as.character(animal_id))%>%
+  left_join(animal_group)%>%
+    mutate(timepoint = factor(timepoint, levels = c("pre_injury", "post-SCI", "8w-SCI", "16w-SCI")),
+         reach_type = factor(reach_type, levels = c("successful", "unsuccessful", "attempt_pellet", "attempt_Nopellet")))
+
+
+all_data_df%>%
+  filter(timepoint == "pre_injury")%>%
+ggplot(aes(frame, PC1, color = group, fill = group))+
+  stat_summary(fun = mean, geom = "line")+
+  stat_summary(fun.data = mean_cl_normal, geom = "ribbon", alpha = 0.3)+
+  facet_grid(timepoint~reach_type)
+
+all_data_df%>%
+  filter(timepoint == "pre_injury")%>%
+ggplot(aes(frame, PC2, color = group, fill = group))+
+  stat_summary(fun = mean, geom = "line")+
+  stat_summary(fun.data = mean_cl_normal, geom = "ribbon", alpha = 0.3)+
+  facet_grid(.~reach_type)
+
+all_data_df%>%
+  filter(timepoint == "pre_injury")%>%
+ggplot(aes(frame, PC3, color = group, fill = group))+
+  stat_summary(fun = mean, geom = "line")+
+  stat_summary(fun.data = mean_cl_normal, geom = "ribbon", alpha = 0.3)+
+  facet_grid(.~reach_type)
+
+all_data_df%>%
+  filter(timepoint == "pre_injury")%>%
+ggplot(aes(frame, angle, color = group, fill = group))+
+  stat_summary(fun = mean, geom = "line")+
+  stat_summary(fun.data = mean_cl_normal, geom = "ribbon", alpha = 0.3)+
+  facet_grid(.~reach_type)
+
+all_data_df%>%
+  filter(timepoint == "pre_injury")%>%
+ggplot(aes(frame, smooth_x_d1, color = group, fill = group))+
+  stat_summary(fun = mean, geom = "line")+
+  stat_summary(fun.data = mean_cl_normal, geom = "ribbon", alpha = 0.3)+
+  facet_grid(.~reach_type)
+
+all_data_df%>%
+  filter(timepoint == "pre_injury")%>%
+ggplot(aes(frame, smooth_x_d2, color = group, fill = group))+
+  stat_summary(fun = mean, geom = "line")+
+  stat_summary(fun.data = mean_cl_normal, geom = "ribbon", alpha = 0.3)+
+  facet_grid(.~reach_type)
+
+all_data_df%>%
+  filter(timepoint == "pre_injury")%>%
+ggplot(aes(frame, smooth_y_d1, color = group, fill = group))+
+  stat_summary(fun = mean, geom = "line")+
+  stat_summary(fun.data = mean_cl_normal, geom = "ribbon", alpha = 0.3)+
+  facet_grid(.~reach_type)
+
+all_data_df%>%
+  filter(timepoint == "pre_injury")%>%
+ggplot(aes(frame, smooth_y_d2, color = group, fill = group))+
+  stat_summary(fun = mean, geom = "line")+
+  stat_summary(fun.data = mean_cl_normal, geom = "ribbon", alpha = 0.3)+
+  facet_grid(.~reach_type)
+
+all_data_df%>%
+ggplot(aes(frame, smooth_x_d1, color = paw_preference))+
+  # geom_path(aes(group = reach_id), alpha = 0.1)+
+  stat_summary(fun = mean, geom = "line")+
+  # stat_summary(fun.data = mean_cl_normal, geom = "ribbon", alpha = 0.3)+
+  facet_grid(timepoint~reach_type)
+
+
+uni_raw_df<-raw_data_all%>%
+  # filter(timepoint == "pre_injury")%>%
+  mutate(animal_id = as.character(animal_id),
+         reach_id = paste(timepoint, animal_id, reach, sep = "_"))%>%
+  left_join(animal_group)
+
+uni_raw_df%>%
+ggplot(aes(x_d1, y_d1, color = group, fill = group))+
+  geom_path(aes(group = reach_id), alpha = 0.3)+
+  facet_grid(group~reach_type)
+
+uni_raw_df%>%
+ggplot(aes(frame, x_d1, color = paw_preference))+
+  # geom_path(aes(group = reach_id), alpha = 0.3)+
+  stat_summary(fun = mean, geom = "line")+
+  # stat_summary(fun.data = mean_cl_normal, geom = "ribbon", alpha = 0.3)+
+  facet_grid(timepoint~group)+
+  xlim(0,70)
+```
+
+## Correcting for X drift
+
+Determining the average X axis drift
+
+```{r}
+L_R_summary<-all_data_df%>%
+  filter(timepoint == "pre_injury")%>%
+  group_by(paw_preference, frame, reach_type)%>%
+  summarise(
+    m_x_d1 = mean(smooth_x_d1, na.rm = T),
+    m_x_d2 = mean(smooth_x_d2, na.rm = T),
+    m_x_d3 = mean(smooth_x_d3, na.rm = T),
+    m_x_d4 = mean(smooth_x_d4, na.rm = T))%>%
+  group_by(frame, reach_type)%>%
+  mutate(
+    d_x_d1 = diff(m_x_d1),
+    d_x_d2 = diff(m_x_d2),
+    d_x_d3 = diff(m_x_d3),
+    d_x_d4 = diff(m_x_d4))%>%
+  group_by(reach_type)%>%
+  summarise(
+    m_x_d1 = mean(d_x_d1),
+    m_x_d2 = mean(d_x_d2),
+    m_x_d3 = mean(d_x_d3),
+    m_x_d4 = mean(d_x_d4))
+
+mean_shift<-sapply(L_R_summary[,-1], mean)
+
+```
+
+### Clean data corrected
+
+Correcting the clean data by the average drift in X axis
+```{r}
+clean_data_all_wide_norm_drift_R<-clean_data_all_wide_norm%>%
+  mutate(animal_id = as.character(animal_id))%>%
+  full_join(animal_group)%>%
+  filter(paw_preference == "R")%>%
+  mutate(
+    smooth_x_d1 = smooth_x_d1-mean_shift[1],
+    smooth_x_d2 = smooth_x_d2-mean_shift[2],
+    smooth_x_d3 = smooth_x_d3-mean_shift[3],
+    smooth_x_d4 = smooth_x_d4-mean_shift[4])
+
+clean_data_all_wide_norm_drift<-clean_data_all_wide_norm%>%
+  mutate(animal_id = as.character(animal_id))%>%
+  full_join(animal_group)%>%
+  filter(paw_preference == "L")%>%
+  bind_rows(clean_data_all_wide_norm_drift_R)
+
+clean_data_all_wide_norm_drift%>%
+ggplot(aes(frame, smooth_x_d1, color = paw_preference))+
+  # geom_path(aes(group = reach_id), alpha = 0.1)+
+  stat_summary(fun = mean, geom = "line")+
+  # stat_summary(fun.data = mean_cl_normal, geom = "ribbon", alpha = 0.3)+
+  facet_grid(timepoint~reach_type)
+```
+
+### KDI
+#### PCA per reach
+
+We are going to perform a PCA for each one of the reaches individually, then deal with the indeterminacies later. The advantage of this is that we do not need to time normalize.
+
+**workflow:**
+
+* split the clean data by reach-animal
+* perform PCA on each with scaling and centering
+* GPA on all loadings to deal with indeterminacy
+
+```{r}
+pre_injury_kdi_df<-clean_data_all_wide_norm_drift%>%
+    filter(reach_type == "successful", 
+           timepoint == "pre_injury")
+
+pre_injury_list<-split(pre_injury_kdi_df, pre_injury_kdi_df$reach_id)
+
+per_reach_pca<-lapply(pre_injury_list, function(x){
+  prcomp(x[,6:13], scale. = T, center = T)
+})
+
+per_reach_loadings<-lapply(per_reach_pca, function(x){
+  x$rotation[,1:3]
+})
+
+animal_id_vec<-unlist(lapply(pre_injury_list, function(x){
+  unique(x$animal_id)
+}))
+
+## rotate the loading with GPA per animal
+gpa_ref_animal<-list()
+for (a in unique(animal_id_vec)){
+  
+  ## Extract consensus
+  animal_ref_index<-which(animal_id_vec == a)
+  temp_ref_loadings<-per_reach_loadings[animal_ref_index]
+  gpa_ref_animal[[as.character(a)]]<-GPA(temp_ref_loadings)
+}
+
+## Rotate scores of all data
+all_data_list<-split(clean_data_all_wide_norm_drift, clean_data_all_wide_norm_drift$reach_id)
+
+animal_id_vec<-unlist(lapply(all_data_list, function(x){
+  unique(x$animal_id)
+}))
+
+rotated_scores<-list()
+for(i in 1:length(all_data_list)){
+  ## Rotate scores
+  consensus<-gpa_ref_animal[which(names(gpa_ref_animal)==
+                                    animal_id_vec[i])][[1]]$consensus
+  
+  temp_df<-all_data_list[[i]]
+  pca_data<-scale(as.matrix(temp_df[,6:13]))
+  scores<-as.data.frame(pca_data%*%consensus)
+  temp_df[,c("PC1", "PC2", "PC3")]<-scores[,1:3]
+  rotated_scores[[i]]<-temp_df
+}
+
+all_data_df<-bind_rows(rotated_scores)
+```
+
+#### derive consensus score
+```{r}
+GPA_scores_ref<-all_data_df%>%
+  filter(reach_type == "successful", timepoint == "pre_injury")
+
+GPA_scores_ref_list<-split.data.frame(GPA_scores_ref, GPA_scores_ref$animal_id)
+
+## rotate the loading with GPA per animal
+gpa_ref_score_animal<-list()
+for (a in names(GPA_scores_ref_list)){
+  ## Extract score consensus
+  temp_reach_list<-split.data.frame(GPA_scores_ref_list[[a]],
+                                    GPA_scores_ref_list[[a]]$reach_id)
+  temp_list<-lapply(temp_reach_list, function(x) x[,c("PC1", "PC2", "PC3")])
+  res_df<-as.data.frame(GPA(temp_list)$consensus)
+  colnames(res_df)<-c("cPC1", "cPC2", "cPC3")
+  res_df$frame<-1:100
+  res_df$animal_id<-a
+  gpa_ref_score_animal[[as.character(a)]]<-res_df
+}
+
+GPA_all_scores_ref<-bind_rows(gpa_ref_score_animal)
+```
+
+
+#### GPA distance
+
+```{r}
+GPA_all_scores_dist<-all_data_df%>%
+  full_join(GPA_all_scores_ref)%>%
+  group_by(frame, reach_id)%>%
+  mutate(eudist = dist(rbind(c(PC1, PC2, PC3),
+                             c(cPC1, cPC2, cPC3))))
+
+saveRDS(GPA_all_scores_dist,"GPA_all_scores_dist_drift.Rds")
+```
+
+
+```{r }
+GPA_all_scores_dist<-readRDS("GPA_all_scores_dist_drift.Rds")
+
+GPA_all_scores_dist_summary<-GPA_all_scores_dist%>%
+  group_by(reach_id)%>%
+  summarise(kdi = sum(eudist),
+            timepoint = unique(timepoint),
+            reach_type = unique(reach_type),
+            animal_id = as.character(unique(animal_id)))%>%
+  full_join(animal_group)%>%
+  mutate(timepoint = factor(timepoint, levels = c("pre_injury", "post-SCI", "8w-SCI", "16w-SCI")),
+         reach_type = factor(reach_type, c("successful", "unsuccessful", 
+                                           "attempt_Nopellet", "attempt_pellet")))
+
+```
+
+# Cohort 2: GTACR
+## Read data
+
+```{r}
+sheets<-readxl::excel_sheets("data/original/new_analyzed GTACR videos.xlsx")
+
+read_sheets<-function(sheet){
+  temp<-read_xlsx("data/original/new_analyzed GTACR videos.xlsx", sheet = sheet)
+  temp$reach_type<-sheet
+  
+  return(temp)
+}
+
+gtacr_raw_df<-map(sheets,.f = read_sheets)%>%
+  bind_rows()
+
+colnames(gtacr_raw_df)<-c("frame", "x_d1", "x_d2", "x_d3", "x_d4", "y_d1", "y_d2", 
+                       "y_d3", "y_d4", "x_p", "y_p","digit_spread", "pellet_d1",
+                       "pellet_d2", "pellet_d3", "pellet_d4",
+                       "angle", "animal_id","timepoint","reach_type")
+```
+
+## Clean all data
+
+```{r}
+## function to add the reach id per session
+add_reach_id<-function(frame){
+  
+  reach<-vector("numeric", length = length(frame))
+  count_reaches<-0
+  # animal<-unique(temp$animal_id)[1]
+  for (i in 1:length(frame)){
+    if (frame[i] == 1){
+      count_reaches<-count_reaches+1
+    }
+    reach[i]<-count_reaches
+  }
+  return(reach)
+}
+
+
+gtacr_raw_df<-gtacr_raw_df%>%
+  arrange(animal_id)%>%
+  group_by(timepoint, animal_id)%>%
+  mutate(reach = add_reach_id(frame))
+
+```
+
+```{r, eval = FALSE}
+# create unique reach identifier
+gtacr_raw_df<-gtacr_raw_df%>%
+  mutate(reach_id = paste(timepoint, animal_id, reach, sep = "_"))
+
+# table(gtacr_raw_df$reach_id, gtacr_raw_df$reach_type)
+
+## Calculate distances between digits
+gtacr_raw_df<-gtacr_raw_df%>%
+  group_by(reach_id, frame)%>%
+  mutate(d1_d2 = dist(rbind(c(x_d1, y_d1),
+                            c(x_d2, y_d2))),
+         d2_d3 = dist(rbind(c(x_d2, y_d2),
+                            c(x_d3, y_d3))),
+         d3_d4 = dist(rbind(c(x_d3, y_d3),
+                            c(x_d4, y_d4))))
+
+# save dataset for future use
+saveRDS(gtacr_raw_df, "new_gtacr_raw_df.Rda")
+```
+
+```{r}
+#load raw all dataset
+gtacr_raw_df<-readRDS("new_gtacr_raw_df.Rda")
+
+#determine quantile threshods
+thr_d1_d2<-quantile(gtacr_raw_df$d1_d2, probs = 0.92)
+thr_d2_d3<-quantile(gtacr_raw_df$d2_d3, probs = 0.92)
+thr_d3_d4<-quantile(gtacr_raw_df$d3_d4, probs = 0.92)
+
+#Eliminate extremes filtered based on the distance between digits
+gtacr_clean_df<-gtacr_raw_df%>%
+  ungroup()%>%
+  rowwise()%>%
+  mutate(x_d1 = ifelse(d1_d2>thr_d1_d2, NA, x_d1),
+         y_d1 = ifelse(d1_d2>thr_d1_d2, NA, y_d1),
+         x_d2 = ifelse(d2_d3>thr_d2_d3 | d1_d2>thr_d1_d2, NA, x_d2),
+         y_d2 = ifelse(d2_d3>thr_d2_d3 | d1_d2>thr_d1_d2, NA, y_d2),
+         x_d3 = ifelse(d2_d3>thr_d2_d3 | d3_d4>thr_d3_d4, NA, x_d3),
+         y_d3 = ifelse(d2_d3>thr_d2_d3 | d3_d4>thr_d3_d4, NA, y_d3),
+         x_d4 = ifelse(d3_d4>thr_d3_d4, NA, x_d4),
+         y_d4 = ifelse(d3_d4>thr_d3_d4, NA, y_d4))
+
+# Calculate mahalanobis distance
+out<-psych::outlier(gtacr_clean_df[,c(2,9)])
+
+gtacr_clean_df<-gtacr_clean_df%>%
+  ungroup()%>%
+  mutate(out = out,
+         filter_out = out>20)%>%## filter based on mahalanobis distance
+  filter(filter_out == FALSE)
+```
+
+
+```{r}
+# table(gtacr_clean_df$reach_id, gtacr_clean_df$reach_type)
+# Summarise based on proportion of NA values. Those reaches with high NA (more tha 20%) are excluded
+gtacr_clean_summary<-gtacr_clean_df%>%
+  group_by(reach_id)%>%
+  summarise_at(.vars = c("x_d1", "y_d1", "x_d2", "y_d2", "x_d3", "y_d3", "x_d4", "y_d4"),
+               .funs = function(x) {mean(is.na(x))})
+
+gtacr_clean_summary$means_nas<-rowMeans(gtacr_clean_summary[,-1])
+reach_to_keep<-gtacr_clean_summary$reach_id[which(gtacr_clean_summary$means_nas<=0.2)]
+
+gtacr_clean_df<-gtacr_clean_df%>%
+  filter(reach_id%in%reach_to_keep)
+
+# Transform to long format
+gtacr_clean_df_long<-gtacr_clean_df%>%
+  pivot_longer(cols = c(x_d1, x_d2, x_d3, x_d4, y_d1, y_d2, y_d3, y_d4, 
+                        pellet_d1, pellet_d2, pellet_d3, pellet_d4))%>%
+  mutate(digit=str_split(name, "_", simplify = T)[,2], 
+         pos_var = str_split(name, "_", simplify = T)[,1],
+         pos_var = ifelse(pos_var == "pellet", "dist_pellet", pos_var))%>%
+  select(-name)%>%
+  pivot_wider(id_cols = c(animal_id, timepoint, reach_id, frame,digit, x_p, y_p,
+                          digit_spread, angle, reach_type), names_from = pos_var)
+
+
+## Use tsclean and supsmu to clean temporal outliers and smooth
+gtacr_clean_df_s<-gtacr_clean_df_long%>%
+  # filter(reach_id == "After SCI_5912_1", digit =="d1")
+  group_by(reach_id, digit)%>%
+  mutate(n_frame= n())%>%
+  filter(n_frame>=20)%>%
+  filter(frame<=(n_frame-5))%>%
+  mutate(clean_x = tsclean(x),
+         clean_y = tsclean(y),
+         clean_x_p = tsclean(x_p),
+         clean_y_p = tsclean(y_p))%>%
+  mutate(smooth_x = supsmu(x = frame, y = clean_x, span = 0.05)$y,
+         smooth_y = supsmu(x = frame, y = clean_y, span = 0.05)$y,
+         smooth_x_p = supsmu(x = frame, y = clean_x_p, span = 0.05)$y,
+         smooth_y_p = supsmu(x = frame, y = clean_y_p, span = 0.05)$y)
+
+## Add features
+gtacr_clean_df_wide<-gtacr_clean_df_s%>%
+  pivot_wider(id_cols = c(animal_id, timepoint, reach_id, frame, reach_type),
+              names_from = "digit",
+                values_from = c("smooth_x","smooth_y", "x", "y"))
+
+gtacr_clean_df_wide<-gtacr_clean_df_wide%>%
+  group_by(reach_id, frame)%>%
+  mutate(d1_d4 = as.numeric(dist(rbind(c(smooth_x_d1, smooth_y_d1),
+                            c(smooth_x_d4, smooth_y_d4)))),
+         angle = sin((smooth_x_d1-smooth_x_d4)/d1_d4)*57.29)%>%
+  group_by(reach_id)%>%
+  mutate(d1_x_speed = abs(c(0,diff(smooth_x_d1))),
+         d1_y_speed = abs(c(0,diff(smooth_y_d1))),
+         d2_x_speed = abs(c(0,diff(smooth_x_d2))),
+         d2_y_speed = abs(c(0,diff(smooth_y_d2))),
+         d3_x_speed = abs(c(0,diff(smooth_x_d3))),
+         d3_y_speed = abs(c(0,diff(smooth_y_d3))),
+         d4_x_speed = abs(c(0,diff(smooth_x_d4))),
+         d4_y_speed = abs(c(0,diff(smooth_y_d4))))
+         
+
+gtacr_clean_df_wide%>%
+    filter(reach_id == "Light On_5912_4")%>%
+  ggplot()+
+  geom_segment(aes(x = smooth_x_d1, xend = smooth_x_d4, 
+                   y = smooth_y_d1, yend = smooth_y_d4), color = "grey")+
+    geom_point(aes(smooth_x_d1, smooth_y_d1))+
+  geom_point(aes(smooth_x_d4, smooth_y_d4), color = "red")
+
+
+gtacr_clean_df_wide%>%
+    filter(animal_id == 5912, reach_type == "Successful")%>%
+  ggplot()+
+  geom_line(aes(frame, d4_y_speed))+
+  facet_wrap(~reach_id)
+
+saveRDS(gtacr_clean_df_wide, "new_gtacr_clean_df_wide.Rds")
+```
+
+### Check cleaning
+
+```{r}
+gtacr_raw_df%>%
+    filter(timepoint == "Baseline", reach_type == "Successful",
+         animal_id == "5912")%>%
+  ggplot(aes(x_d3,y_d3))+
+  geom_path()+
+  geom_path(data = gtacr_clean_df_wide%>%
+    filter(timepoint == "Baseline", reach_type == "Successful",
+         animal_id == "5912"), aes(x_d3, y_d3), color = "red")+
+  facet_wrap(~reach_id)
+
+gtacr_raw_df%>%
+    filter(timepoint == "Baseline", reach_type == "Successful",
+         animal_id == "5912")%>%
+  ggplot(aes(frame,y_d3))+
+  geom_path()+
+  geom_path(data = gtacr_clean_df_wide%>%
+    filter(timepoint == "Baseline", reach_type == "Successful",
+         animal_id == "5912"), aes(frame, smooth_y_d3), color = "red")+
+  facet_wrap(~reach_id)
+
+```
+
+### time normalization
+```{r}
+gtacr_clean_df_wide_norm<-gtacr_clean_df_wide%>%
+  group_by(reach_id)%>%
+  reframe(animal_id = unique(animal_id),
+            frame = 1:100,
+            timepoint = unique(timepoint),
+            reach_type = unique(reach_type),
+            smooth_x_d1 = approx(x = 1:n(), y = smooth_x_d1, n = 100)$y,
+            smooth_x_d2 = approx(x = 1:n(), y = smooth_x_d2, n = 100)$y, 
+            smooth_x_d3 = approx(x = 1:n(), y = smooth_x_d3, n = 100)$y, 
+            smooth_x_d4 = approx(x = 1:n(), y = smooth_x_d4, n = 100)$y, 
+            smooth_y_d1 = approx(x = 1:n(), y = smooth_y_d1, n = 100)$y, 
+            smooth_y_d2 = approx(x = 1:n(), y = smooth_y_d2, n = 100)$y, 
+            smooth_y_d3 = approx(x = 1:n(), y = smooth_y_d3, n = 100)$y, 
+            smooth_y_d4 = approx(x = 1:n(), y = smooth_y_d4, n = 100)$y,
+            d1_d4 = approx(x = 1:n(), y = d1_d4, n = 100)$y,
+            angle = approx(x = 1:n(), y = angle, n = 100)$y,
+            d1_x_speed = approx(x = 1:n(), y = d1_x_speed, n = 100)$y,
+            d2_x_speed = approx(x = 1:n(), y = d2_x_speed, n = 100)$y,
+            d3_x_speed = approx(x = 1:n(), y = d3_x_speed, n = 100)$y,
+            d4_x_speed = approx(x = 1:n(), y = d4_x_speed, n = 100)$y,
+            d1_y_speed = approx(x = 1:n(), y = d1_y_speed, n = 100)$y,
+            d2_y_speed = approx(x = 1:n(), y = d2_y_speed, n = 100)$y,
+            d3_y_speed = approx(x = 1:n(), y = d3_y_speed, n = 100)$y,
+            d4_y_speed = approx(x = 1:n(), y = d4_y_speed, n = 100)$y)
+
+saveRDS(gtacr_clean_df_wide_norm, "new_gtacr_clean_df_wide_norm.Rds")
+```
+
+### Filtering trials
+
+There are several trials for which the processing fails due to high inaccuracies from the markerless prediction. We will manually filter those for the purpose of understanding the KDI metrics better.
+
+```{r}
+# function to facilitate iterate through all trials to select them
+
+raw_clean_plot<-function(a= NULL, r = NULL, tp = NULL, id = NULL){
+  
+  clean_plot_df<-gtacr_clean_df_wide_norm%>%
+    filter(reach_id == id)%>%
+    select(-reach_type, -timepoint, -animal_id)%>%
+    pivot_longer(-c(reach_id, frame))%>%
+    filter(str_detect(name, "smooth"))%>%
+    mutate(digit = str_extract(name, "d[[:digit:]]"),
+           coor = str_extract(name, "x|y"))%>%
+    pivot_wider(id_cols = c(reach_id, frame, digit), names_from = 
+                  "coor")
+  
+  raw_plot_df<-gtacr_raw_df%>%
+    filter(reach_id == id)%>%
+    select(-reach_type, -timepoint, -animal_id, -d1_d2, -d2_d3, -d3_d4)%>%
+    pivot_longer(-c(reach_id, frame))%>%
+    filter(str_detect(name, "_d"))%>%
+    mutate(digit = str_extract(name, "d[[:digit:]]"),
+           coor = str_extract(name, "x|y"))%>%
+    pivot_wider(id_cols = c(reach_id, frame, digit), names_from = 
+                  "coor")
+    
+  ggplot(clean_plot_df,aes(x, y, group = digit, color = digit))+
+    geom_path()+
+    geom_point(data = clean_plot_df%>%filter(frame == 1))+
+    geom_point(data = clean_plot_df%>%filter(frame == 100), shape = 21)+
+    facet_wrap(~reach_id)+
+    theme_minimal()+
+    xlab("x coordinate")+ylab("y coordinate")+
+    theme(legend.position = c(0.85, 0.12))+
+    coord_equal()
+}
+
+# # Iteration through all the trials
+# iterator_df<-expand.grid(a = unique(gtacr_clean_df_wide_norm$animal_id),
+#                          r = unique(gtacr_clean_df_wide_norm$reach_type),
+#                          tp = unique(gtacr_clean_df_wide_norm$timepoint))
+# 
+# reach_ids<-unique(gtacr_clean_df_wide_norm$reach_id)
+# res<-vector(length = length(reach_ids))
+# for(i in 1:length(reach_ids)){
+#   plot(raw_clean_plot(id = reach_ids[i]))
+#   res[i]<-readline("Y/N")
+# }
+# 
+# # logical vector containing whether to keep (T) or not (F) a specific trial
+# res[res=="FF"]<-F
+# res<-as.logical(res)
+# 
+# reach_keep<-reach_ids[res]
+# saveRDS(res, "res_filter_reach_id.Rds")
+# write.csv(reach_ids[!res], "res_filter_reach_id.csv", row.names = F)
+```
+
+```{r}
+# selected trial data
+gtacr_clean_df_wide_norm_f<-gtacr_clean_df_wide_norm
+```
+
+## KDI normalized
+### PCA per reach 
+
+We are going to perform a PCA for each one of the reaches individually, then deal with the indeterminacy later. The advantage of this is that we do not need to time normalize.
+
+**workflow:**
+
+* split the clean data by reach-animal
+* perform PCA on each with scaling and centering
+* GPA on all loadings to deal with indeterminacy
+
+**PCA per reach**
+
+```{r}
+# clean_data_all_wide_norm<-readRDS("clean_data_all_wide_norm.Rds")
+
+baseline_kdi_df<-gtacr_clean_df_wide_norm_f%>%
+    filter(reach_type == "Successful", 
+           timepoint == "Baseline")
+
+gtacr_clean_df_wide_norm_f<-gtacr_clean_df_wide_norm_f%>%
+  filter(animal_id %in% baseline_kdi_df$animal_id)
+
+baseline_list<-split(baseline_kdi_df, baseline_kdi_df$reach_id)
+
+bl_reach_pca<-lapply(baseline_list, function(x){
+  prcomp(x[,6:13], scale. = T, center = T)
+})
+
+bl_reach_loadings<-lapply(bl_reach_pca, function(x){
+  x$rotation[,1:3]
+})
+
+animal_id_vec<-unlist(lapply(baseline_list, function(x){
+  unique(x$animal_id)
+}))
+
+## rotate the loading with GPA per animal
+gpa_ref_animal<-list()
+for (a in unique(animal_id_vec)){
+  
+  ## Extract consensus
+  animal_ref_index<-which(animal_id_vec == a)
+  temp_ref_loadings<-bl_reach_loadings[animal_ref_index]
+  if (length(temp_ref_loadings)<=1){
+    gpa_ref_animal[[as.character(a)]]<-list(consensus=as.data.frame(temp_ref_loadings))
+  }else{
+      gpa_ref_animal[[as.character(a)]]<-GPA(temp_ref_loadings)
+  }
+}
+
+## Rotate scores of all data
+gtacr_all_data_list<-split(gtacr_clean_df_wide_norm_f, gtacr_clean_df_wide_norm_f$reach_id)
+
+animal_id_vec<-unlist(lapply(gtacr_all_data_list, function(x){
+  unique(x$animal_id)
+}))
+
+gtacr_rotated_scores<-list()
+for(i in 1:length(gtacr_all_data_list)){
+  ## Rotate scores
+  consensus<-gpa_ref_animal[which(names(gpa_ref_animal)==
+                                    animal_id_vec[i])][[1]]$consensus
+  colnames(consensus)<-c("PC1", "PC2", "PC3")
+  
+  temp_df<-gtacr_all_data_list[[i]]
+  pca_data<-scale(as.matrix(temp_df[,6:13]))
+  scores<-as.data.frame(pca_data%*%as.matrix(consensus))
+  temp_df[,c("PC1", "PC2", "PC3")]<-scores[,1:3]
+  gtacr_rotated_scores[[i]]<-temp_df
+}
+
+gtacr_all_data_df<-bind_rows(gtacr_rotated_scores)
+saveRDS(gtacr_all_data_df, "gtacr_all_data_df.Rds")
+```
+
+#### derive consensus score
+```{r}
+gtacr_GPA_scores_ref<-gtacr_all_data_df%>%
+      filter(reach_type == "Successful", 
+           timepoint == "Baseline")
+
+gtacr_GPA_scores_ref_list<-split.data.frame(gtacr_GPA_scores_ref, gtacr_GPA_scores_ref$animal_id)
+
+## rotate the loading with GPA per animal
+gtacr_gpa_ref_score_animal<-list()
+for (a in names(gtacr_GPA_scores_ref_list)){
+  ## Extract score consensus
+  temp_reach_list<-split.data.frame(gtacr_GPA_scores_ref_list[[a]],
+                                    gtacr_GPA_scores_ref_list[[a]]$reach_id)
+  temp_list<-lapply(temp_reach_list, function(x) x[,c("PC1", "PC2", "PC3")])
+  
+  if (length(temp_list)<=1){
+    res_df<-as.data.frame(temp_list)
+  }else{
+    res_df<-as.data.frame(GPA(temp_list)$consensus)
+  }
+  
+  colnames(res_df)<-c("cPC1", "cPC2", "cPC3")
+  res_df$frame<-1:100
+  res_df$animal_id<-a
+  gtacr_gpa_ref_score_animal[[as.character(a)]]<-res_df
+}
+
+gtacr_GPA_all_scores_ref<-bind_rows(gtacr_gpa_ref_score_animal)
+```
+
+
+```{r}
+gtacr_GPA_all_scores_dist<-gtacr_all_data_df%>%
+  mutate(animal_id=as.character(animal_id))%>%
+  full_join(gtacr_GPA_all_scores_ref)%>%
+  group_by(frame, reach_id)%>%
+  mutate(eudist = dist(rbind(c(PC1, PC2, PC3),
+                             c(cPC1, cPC2, cPC3))))
+
+saveRDS(gtacr_GPA_all_scores_dist,"gtacr_GPA_all_scores_dist.Rds")
+
+gtacr_GPA_all_scores_dist_summary<-gtacr_GPA_all_scores_dist%>%
+  group_by(reach_id)%>%
+  summarise(kdi = sum(eudist),
+            timepoint = unique(timepoint),
+            reach_type = unique(reach_type),
+            animal_id = as.character(unique(animal_id)))%>%
+  mutate(reach_type = case_when(
+    reach_type == "Miss"~"Unsuccessful",
+    TRUE ~ reach_type
+  ))%>%
+  mutate(reach_type = factor(reach_type, c("Successful", "Unsuccessful", 
+                                           #"Attempts without Pellet",
+                                           "Attempts with pellet")))
+```
+
+# Analysis and Figures
+## Pre injury analysis
+
+### Cohort 1: NT study
+```{r}
+## KDI fit for pre injury reach types
+nt_fit_pre_injury<-lmer(kdi~reach_type+(1|animal_id), 
+                     data = GPA_all_scores_dist_summary%>%
+                       filter(timepoint=="pre_injury", reach_type!="attempt_Nopellet"))
+
+anova(nt_fit_pre_injury)
+
+sjPlot::plot_model(nt_fit_pre_injury, type = "pre", terms = c("reach_type"))
+emmeans::emmeans(nt_fit_pre_injury, pairwise~reach_type)
+```
+
+### Cohort 2: GTACR study
+
+```{r}
+## KDI fit for pre injury reach types
+gtacr_fit_pre_injury<-lmer(kdi~reach_type+(1|animal_id), 
+                     data = gtacr_GPA_all_scores_dist_summary%>%
+                       filter(timepoint=="Baseline", reach_type!="Attempts without Pellet"))
+
+anova(gtacr_fit_pre_injury)
+
+sjPlot::plot_model(gtacr_fit_pre_injury, type = "pre", terms = c("reach_type"))
+emmeans::emmeans(gtacr_fit_pre_injury, pairwise~reach_type)
+```
+
+## Post Injury analysis
+### Cohort 1: NT study
+```{r }
+# post SCI injury
+nt_fit_post<-lmer(kdi~timepoint + (timepoint|animal_id), data = GPA_all_scores_dist_summary%>%
+                    filter(reach_type!="attempt_Nopellet", timepoint %in% c("pre_injury", "post-SCI")))
+
+anova(nt_fit_post)
+
+sjPlot::plot_model(nt_fit_post, type = "pre", terms = c("timepoint"))
+emmeans::emmeans(nt_fit_post, pairwise~timepoint)
+
+# Fit by reachtype
+nt_fit_byreach<-lmer(kdi~timepoint*reach_type + (timepoint|animal_id), data = 
+                       GPA_all_scores_dist_summary%>%filter(reach_type!="attempt_Nopellet", 
+                                                         timepoint %in% c("pre_injury", "post-SCI")))
+
+anova(nt_fit_byreach)
+
+sjPlot::plot_model(nt_fit_byreach, type = "pre", terms = c("timepoint", "reach_type"))
+emmeans::emmeans(nt_fit_byreach, pairwise~reach_type|timepoint)
+
+## fit KD trajectories pre injury
+nt_fit_eudits<-lmer(eudist~ns(frame, 7)*factor(reach_type)+(frame|reach_id), 
+              data = GPA_all_scores_dist%>%
+                filter(timepoint == "pre_injury", animal_id == "4910"))
+
+anova(fit_eudits_4910)
+sjPlot::plot_model(nt_fit_eudits, type = "pre", terms = c("frame [all]","reach_type"))
+
+GPA_all_scores_dist%>%
+  filter(timepoint == "pre_injury", animal_id == "4910")%>%
+ggplot(aes(frame, eudist, group = reach_id, color = reach_type))+
+  # geom_line()+
+  stat_summary(fun.data = mean_se, geom = "ribbon", 
+               aes(group = reach_type, fill = reach_type), alpha = 0.3)+
+  stat_summary(fun = "mean", geom = "line", aes(group = reach_type))
+
+```
+
+### Cohort 2: GTACR study
+```{r }
+gtacr_GPA_all_scores_dist_summary<-gtacr_GPA_all_scores_dist_summary%>%
+  mutate(timepoint = factor(timepoint, 
+                            levels = c("Baseline","LightOn","AfterSCI",
+                                       "BaselineAfterSCI",
+                                       "LightOnAfterRehab")))
+
+# post SCI injury
+gtacr_fit_post<-lmer(kdi~timepoint + (timepoint|animal_id), 
+                     data = gtacr_GPA_all_scores_dist_summary%>%
+                       filter(!timepoint %in% c("BaselineAfterSCI", 
+                                                "LightOnAfterRehab"),
+                              reach_type!="Attempts without Pellet"))
+
+anova(gtacr_fit_post)
+sjPlot::plot_model(gtacr_fit_post, type = "pre", terms = c("timepoint"))
+emmeans::emmeans(gtacr_fit_post, pairwise~timepoint)
+
+# Fit by reachtype
+gtacr_fit_byreach<-lmer(kdi~timepoint*reach_type + (timepoint|animal_id), data = gtacr_GPA_all_scores_dist_summary%>%
+                       filter(
+                          !timepoint %in% c("BaselineAfterSCI", 
+                                            "LightOnAfterRehab"),
+                              reach_type!="Attempts without Pellet"))
+
+anova(gtacr_fit_byreach)
+
+sjPlot::plot_model(gtacr_fit_byreach, type = "pre", terms = c("timepoint", "reach_type"))
+
+emmeans::emmeans(gtacr_fit_byreach, pairwise~reach_type|timepoint)
+```
+
+## Plots and Figures
+### Plot examples
+
+```{r }
+## Selected plots
+clean_plot_df<-clean_data_all_wide_norm_drift%>%
+  filter(animal_id=="4915", reach_type == "successful",timepoint == "pre_injury")%>%
+  select(-reach_type, -timepoint, -animal_id, -paw_preference, -Sex, -group)%>%
+  pivot_longer(-c(reach_id, frame))%>%
+  filter(str_detect(name, "smooth"))%>%
+  mutate(digit = str_extract(name, "d[[:digit:]]"),
+         coor = str_extract(name, "x|y"))%>%
+  pivot_wider(id_cols = c(reach_id, frame, digit), names_from = 
+                "coor")
+### Plot XY
+clean_plot_df%>%
+  filter(reach_id %in% c("pre_injury_4915_18", "pre_injury_4915_20"))%>%
+ggplot(aes(x, y, group = digit, color = digit))+
+  geom_path()+
+  geom_point(data = clean_plot_df%>%filter(frame == 1,
+                                           reach_id %in% c("pre_injury_4915_18", "pre_injury_4915_20")))+
+  geom_point(data = clean_plot_df%>%filter(frame == 100,
+                                           reach_id %in% c("pre_injury_4915_18", "pre_injury_4915_20")), shape = 21)+
+  facet_wrap(~reach_id)+
+  theme_minimal()+
+  xlab("x coordinate")+ylab("y coordinate")+
+  theme(legend.position = c(0.85, 0.12))+
+  coord_equal()
+
+```
+
+
+```{r}
+GPA_all_scores_dist<-GPA_all_scores_dist%>%
+  mutate(animal_id = as.character(animal_id))%>%
+  full_join(animal_group)%>%
+  mutate(timepoint = factor(timepoint, levels = c("pre_injury", "post-SCI", "8w-SCI",  "16w-SCI")),
+         eudist = as.numeric(eudist),
+         reach_type = factor(reach_type, levels = c("successful", "unsuccessful", "attempt_pellet", "attempt_Nopellet")))
+```
+
+### Figure 3
+
+```{r}
+
+## prediction fit_pre_injury
+Fig3a<-ggeffects::ggpredict(nt_fit_pre_injury)[[1]]%>%
+  ggplot(aes(x, predicted))+
+  geom_point(size =2, col = "red")+
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.3, col = "red")+
+  theme_minimal()+
+  ylim(80, 270)+
+  xlab(NULL)+ylab("KDI (estimated ± 95% CI)")+
+  scale_x_discrete(labels = c("Success", "Grasping fail", "Reaching fail"))
+
+Fig3b<-ggeffects::ggpredict(gtacr_fit_pre_injury)[[1]]%>%
+  ggplot(aes(x, predicted))+
+  geom_point(size =2, col = "red")+
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.3, col = "red")+
+  theme_minimal()+
+  ylim(80, 270)+
+  xlab(NULL)+ylab("KDI (estimated ± 95% CI)")+
+  scale_x_discrete(labels = c("Success", "Grasping fail", "Reaching fail"))
+
+#Fig 3c
+## fit KD trajectories pre injury for a single animal example 4910
+fit_eudits_4910<-lmer(eudist~ns(frame, 7)*factor(reach_type)+(frame|reach_id), 
+              data = GPA_all_scores_dist%>%
+                filter(timepoint == "pre_injury", animal_id == 4910, reach_type!="attempt_Nopellet"))
+pred_eudits_4910<-ggeffects::ggpredict(fit_eudits_4910, terms = c("frame [all]", "reach_type"))
+
+pred_eudits_4910<-pred_eudits_4910%>%
+  as.data.frame()%>%
+  mutate(group = case_when(
+    group == "unsuccessful"~"Grasping fail",
+    group == "successful"~"Success",
+    group == "attempt_pellet"~"Reaching fail"))
+fig3c<-ggplot(pred_eudits_4910,aes(x, predicted, group = group))+
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high, fill = group), alpha = 0.3)+
+  geom_line(aes(color = group))+
+  theme_minimal()+
+  xlab("% time of trial")+ylab("Distance to reference\n(estimated ± 95% CI)")+
+  theme(legend.position = c(0.3,0.85), legend.title = element_blank())
+
+
+fig3<-(Fig3a+Fig3b)/fig3c+plot_annotation(tag_levels = "a")
+ggsave("plots/kdi_fig3.png", fig3, width = 8, height = 6)
+```
+
+### Figure 4
+
+```{r}
+
+fig4a<-ggeffects::ggpredict(nt_fit_post)[[1]]%>%
+  ggplot(aes(x, predicted))+
+  geom_point(size =2, col = "red")+
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.3, col = "red")+
+  theme_minimal()+
+  xlab(NULL)+ylab("KDI (estimated ± 95% CI)")+
+  scale_x_discrete(labels = c("Pre SCI", "chronic SCI"))+
+  ylim(100, 320)+
+  ggtitle("Cohort 1")
+
+fig4b<-ggeffects::ggpredict(nt_fit_byreach, terms = c("timepoint", "reach_type"))%>%
+  as.data.frame()%>%
+  mutate(group = case_when(
+    group == "unsuccessful"~"Grasping fail",
+    group == "successful"~"Success",
+    group == "attempt_pellet"~"Reaching fail"),
+    group = factor(group, levels = c("Success", "Grasping fail", "Reaching fail")))%>%
+  ggplot(aes(x, predicted, color = group))+
+  geom_point(size =2, position = position_dodge(width = 0.5))+
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.3,
+                position = position_dodge(width = 0.5))+
+  theme_minimal()+
+  xlab(NULL)+ylab("KDI (estimated ± 95% CI)")+
+  scale_x_discrete(labels = c("Pre SCI", "chronic SCI"))+
+  ylim(100, 320)+
+  ggtitle("Cohort 1")
+
+fig4c<-ggeffects::ggpredict(gtacr_fit_post)[[1]]%>%
+  ggplot(aes(x, predicted))+
+  geom_point(size =2, col = "red")+
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.3, col = "red")+
+  theme_minimal()+
+  xlab(NULL)+ylab("KDI (estimated ± 95% CI)")+
+  scale_x_discrete(labels = c("Pre SCI", "M1 silencing (Pre SCI)", "Acute SCI"))+
+  ylim(100, 320)+
+  ggtitle("Cohort 2")
+
+fig4d<-ggeffects::ggpredict(gtacr_fit_byreach, terms = c("timepoint", "reach_type"))%>%
+  as.data.frame()%>%
+  mutate(group = case_when(
+    group == "Unsuccessful"~"Grasping fail",
+    group == "Successful"~"Success",
+    group == "Attempts with pellet"~"Reaching fail"),
+    group = factor(group, levels = c("Success", "Grasping fail", "Reaching fail")))%>%
+  ggplot(aes(x, predicted, color = group))+
+  geom_point(size =2, position = position_dodge(width = 0.5))+
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.3,
+                position = position_dodge(width = 0.5))+
+  theme_minimal()+
+  xlab(NULL)+ylab("KDI (estimated ± 95% CI)")+
+  ylim(100, 320)+
+  scale_x_discrete(labels = c("Pre SCI", "M1 silencing (Pre SCI)", "Acute SCI"))+
+  ggtitle("Cohort 2")
+
+
+## fit KD trajectories for a single animal example
+
+gtacr_GPA_all_scores_dist%>%
+  filter(timepoint %in% c("LightOn", "Baseline"), 
+         !reach_type %in% c("Attempts without Pellet", "Attempts with Pellet"), 
+         animal_id == "5912")%>%
+  ggplot(aes(frame, eudist, group = reach_id, color = timepoint))+
+  geom_line()+
+  facet_wrap(~reach_type)
+
+
+fit_eudits_5912<-lmer(eudist~ns(frame, 7)*timepoint+(frame|reach_id), 
+              data = gtacr_GPA_all_scores_dist%>%
+                filter(timepoint %in% c("LightOn", "Baseline"), 
+         reach_type =="Successful", animal_id == "5912"))
+
+pred_eudits_5912<-ggeffects::ggpredict(fit_eudits_5912, terms = c("frame [all]", "timepoint"))
+
+emmeans::emmeans(fit_eudits_5912, pairwise~timepoint|frame, 
+                 at = list(frame = seq(1,101,10)))
+
+fig4e<-ggplot(pred_eudits_5912,aes(x, predicted, group = group))+
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high, fill = group), alpha = 0.3)+
+  geom_line(aes(color = group))+
+  theme_minimal()+
+  xlab("% time of trial")+ylab("Distance to reference\n(estimated ± 95% CI)")+
+  theme(legend.position = c(0.2,0.85), legend.title = element_blank())+
+  ylim(0,4.5)+
+  ggtitle("Example animal from Cohort 2: Successful trials")
+
+fit_eudits_5912b<-lmer(eudist~ns(frame, 7)*timepoint+(frame|reach_id), 
+              data = gtacr_GPA_all_scores_dist%>%
+                filter(timepoint %in% c("LightOn", "Baseline"), 
+         reach_type =="Miss", animal_id == "5912"))
+
+emmeans::emmeans(fit_eudits_5912b, pairwise~timepoint|frame, 
+                 at = list(frame = seq(1,100, length = 10)))
+
+pred_eudits_5912b<-ggeffects::ggpredict(fit_eudits_5912b, terms = c("frame [all]", "timepoint"))
+
+fig4f<-ggplot(pred_eudits_5912b,aes(x, predicted, group = group))+
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high, fill = group), alpha = 0.3)+
+  geom_line(aes(color = group))+
+  theme_minimal()+
+  xlab("% time of trial")+ylab("Distance to reference\n(estimated ± 95% CI)")+
+  theme(legend.position = c(0.2,0.85), legend.title = element_blank())+
+  ylim(0,4.5)+
+  ggtitle("Example animal from Cohort 2: Grasping fail trials")
+
+fig4_layaout<-c(
+  area(1,1), area(1,2),
+  area(2,1), area(2,2),
+  area(3,1, r = 2),
+  area(4,1, r = 2)
+)
+
+fig4<-fig4a+fig4b+fig4c+fig4d+fig4e+fig4f+plot_layout(design = fig4_layaout, guides = "collect")+plot_annotation(tag_levels = "a")
+
+ggsave("plots/kdi_dev_fig4.png", fig4, width = 10, height = 10)
+```
+
+## Supplementary Figure
+
+### Sub Fig 1
+
+```{r}
+GPA_all_scores_dist_summary%>%
+  filter(timepoint=="pre_injury")%>%
+ggplot(aes(reach_type,kdi, color = reach_type))+
+  stat_summary(fun = "mean", geom = "point")+
+  stat_summary(fun.data = mean_se, geom = "errorbar")+
+  facet_wrap(.~animal_id, nrow = 3)
+
+## KD trajectories for pre injury reach types
+GPA_all_scores_dist%>%
+  filter(timepoint == "pre_injury")%>%
+ggplot(aes(frame, eudist, group = reach_id, color = animal_id))+
+  # geom_line(alpha = 0.1)+
+  stat_summary(fun = "mean", geom = "line", 
+               aes(group = animal_id), show.legend = F)+
+  facet_wrap(.~reach_type)
+```
+
+
+### data processing
+```{r}
+### Plot y
+clean_plot_df_noNorm<-clean_data_all_wide%>%
+  filter(animal_id=="4875", reach_type == "successful",timepoint == "pre_injury")
+
+figS1a<-ggplot(clean_plot_df_noNorm, aes(frame, x_d1))+
+  geom_line()+
+  geom_point(alpha = 0.4)+
+  geom_line(aes(y = smooth_x_d1), color = "red")+
+  facet_wrap(~reach_id, nrow = 2)+
+  theme_minimal()+
+  ylab("y coordinate")
+
+#Individual animals
+clean_plot_df<-clean_data_all_wide_norm%>%
+  filter(animal_id=="4875", reach_type == "successful",timepoint == "pre_injury")%>%
+  select(-reach_type, -timepoint, -animal_id)%>%
+  pivot_longer(-c(reach_id, frame))%>%
+  filter(str_detect(name, "smooth"))%>%
+  mutate(digit = str_extract(name, "d[[:digit:]]"),
+         coor = str_extract(name, "x|y"))%>%
+  pivot_wider(id_cols = c(reach_id, frame, digit), names_from = 
+                "coor")
+
+raw_plot_df<-raw_data_all_long%>%
+  filter(animal_id=="4875", reach_type == "successful",timepoint == "pre_injury")%>%
+  select(-reach_type, -timepoint, -animal_id)
+  
+### Plot X
+figS1b<-ggplot(clean_plot_df,aes(x, y, group = digit, color = digit))+
+  geom_path(show.legend = F)+
+  geom_point(data = clean_plot_df%>%filter(frame == 1),show.legend = F)+
+  geom_point(data = clean_plot_df%>%filter(frame == 100), shape = 21,show.legend = F)+
+  facet_wrap(~reach_id, nrow = 2)+
+  theme_minimal()+
+  xlab("x coordinate")+ylab("y coordinate")
+  # theme(legend.position = c(0.85, 0.12))+
+  # coord_equal()
+
+figS1c<-ggplot(clean_plot_df,aes(frame, y, group = reach_id, color = digit))+
+  geom_path(show.legend = F)+
+  facet_wrap(~digit, nrow = 1)+
+  theme_minimal()+
+  xlab("Time (% of task sequence)")+ylab("y coordinate")
+  # theme(legend.position = c(0.85, 0.12))
+  # coord_equal()
+  
+figS1d<-ggplot(clean_plot_df,aes(frame, x, group = reach_id, color = digit))+
+  geom_path(show.legend = F)+
+  facet_wrap(~digit, nrow = 1)+
+  theme_minimal()+
+  xlab("Time (% of task sequence)")+ylab("x coordinate")
+  # theme(legend.position = c(0.85, 0.12))
+  # coord_equal()
+
+figS1<-figS1a+figS1c+figS1d+figS1b+plot_layout(ncol = 1)+plot_annotation(tag_levels = "a")
+ggsave("figs1.png", figS1, height = 12, width = 7)
+```
+
+
